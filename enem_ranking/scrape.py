@@ -1,216 +1,108 @@
 """
 Scraper do Ranking ENEM (Evolucional Microdados).
 
-Fonte: https://microdados.evolucional.com.br/microdados/ranking-enem-atual?redacao=sim
-A tabela é carregada via JavaScript, então usamos Playwright (navegador real).
+Página: https://microdados.evolucional.com.br/microdados/ranking-enem-atual?redacao=sim
+A tabela (DataTables, 50/página, ~464 páginas) é montada no navegador a partir de UM endpoint JSON
+que traz todas as escolas de uma vez:
+    https://microdados.evolucional.com.br/microdados/ranked-schools/<ano>
 
-Saídas (em enem_ranking/data/):
-  - ranking_enem_redacao.csv      -> linhas da tabela (DOM), todas as páginas
-  - api_responses.jsonl           -> respostas JSON capturadas da rede (dados brutos da API)
-  - network_log.json              -> endpoints XHR/fetch vistos (diagnóstico)
-  - debug_page.html / debug.png   -> snapshot em caso de falha
+Estratégia: GET direto no JSON (requests). Se falhar (bloqueio/JS), abre a página com Playwright
+e captura a mesma resposta da rede.
 
-Uso:
-  python enem_ranking/scrape.py [--max-pages 464] [--headful]
+Mapeamento de campos (validado contra a tabela exibida):
+  SH=Escola  I=Código INEP  C=Cidade  S=UF  D=Dependência  L=Localização  A=Alunos
+  LC, CH, CN, MT, RD = notas por área
+  G  = média sem redação (4 áreas)   P  = posição sem redação
+  GC = média com redação (5 áreas)   PC = posição com redação  (ranking ?redacao=sim)
+
+Uso:  python enem_ranking/scrape.py [--ano 2025]
 """
 import argparse
 import csv
 import json
-import re
 import sys
-import time
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
-
-URL = "https://microdados.evolucional.com.br/microdados/ranking-enem-atual?redacao=sim"
+PAGE = "https://microdados.evolucional.com.br/microdados/ranking-enem-atual?redacao=sim"
+API = "https://microdados.evolucional.com.br/microdados/ranked-schools/{ano}"
 OUT = Path(__file__).parent / "data"
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"
 
-NEXT_SELECTORS = [
-    "a:has-text('Próximo')", "button:has-text('Próximo')",
-    "a:has-text('Próxima')", "button:has-text('Próxima')",
-    "a:has-text('Seguinte')", "button:has-text('Seguinte')",
-    "li.next:not(.disabled) a", ".paginate_button.next:not(.disabled)",
-    "[aria-label='Next']", "[aria-label='Próxima página']", "[aria-label='Próximo']",
-    "a:text-is('»')", "button:text-is('»')", "a:text-is('›')", "button:text-is('›')",
-    "a:text-is('>')", "button:text-is('>')",
+COLS = [
+    ("PC", "posicao_com_redacao"), ("P", "posicao_sem_redacao"),
+    ("I", "codigo_inep"), ("SH", "escola"), ("C", "cidade"), ("S", "uf"),
+    ("D", "dependencia_administrativa"), ("L", "localizacao"), ("A", "alunos"),
+    ("LC", "nota_lc"), ("CH", "nota_ch"), ("CN", "nota_cn"), ("MT", "nota_mt"), ("RD", "nota_redacao"),
+    ("GC", "media_com_redacao"), ("G", "media_sem_redacao"),
 ]
+NUM = {"LC", "CH", "CN", "MT", "RD", "G", "GC"}
 
 
-def unique(names):
-    seen, out = {}, []
-    for n in names:
-        n = re.sub(r"\s+", " ", n).strip() or "col"
-        if n in seen:
-            seen[n] += 1
-            out.append(f"{n}_{seen[n]}")
-        else:
-            seen[n] = 1
-            out.append(n)
-    return out
+def via_requests(ano):
+    import requests
+    r = requests.get(API.format(ano=ano), timeout=120,
+                     headers={"User-Agent": UA, "Referer": PAGE, "X-Requested-With": "XMLHttpRequest",
+                              "Accept": "application/json"})
+    r.raise_for_status()
+    return r.json()
 
 
-def table_rows(page):
-    """Retorna (headers, rows) da maior tabela da página."""
-    return page.evaluate(
-        """() => {
-        const tables = [...document.querySelectorAll('table')];
-        if (!tables.length) return [[], []];
-        const t = tables.sort((a,b)=>b.querySelectorAll('tr').length-a.querySelectorAll('tr').length)[0];
-        const headRows = [...t.querySelectorAll('thead tr')];
-        const head = headRows.length ? [...headRows[headRows.length-1].querySelectorAll('th,td')].map(e=>e.innerText.trim()) : [];
-        const body = [...t.querySelectorAll('tbody tr')].map(tr=>[...tr.querySelectorAll('td')].map(td=>td.innerText.replace(/\\s+/g,' ').trim()));
-        return [head, body.filter(r=>r.length>1 && !r.join(' ').toLowerCase().includes('carregando'))];
-    }"""
-    )
+def via_playwright(ano):
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        pg = b.new_page()
+        with pg.expect_response(lambda r: "/ranked-schools/" in r.url, timeout=120000) as info:
+            pg.goto(PAGE, timeout=120000)
+        data = info.value.json()
+        b.close()
+        return data
 
 
-def wait_rows(page, timeout=60):
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        _, rows = table_rows(page)
-        if rows:
-            return rows
-        time.sleep(0.5)
-    raise RuntimeError("Tabela não carregou")
-
-
-def set_page_size_50(page):
-    # tenta <select> primeiro
-    for sel in page.query_selector_all("select"):
-        opts = [o.inner_text().strip() for o in sel.query_selector_all("option")]
-        if "50" in opts:
-            try:
-                sel.select_option(label="50", timeout=3000)
-            except Exception:
-                sel.evaluate("""s=>{const o=[...s.options].find(o=>o.text.trim()=='50'); s.value=o.value;
-                    s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true}));}""")
-            return "select"
-    # depois links/botões com texto "50" próximos de "Resultados por página"
-    for loc in [
-        "xpath=//*[contains(normalize-space(.),'Resultados por página')]/following::*[normalize-space(text())='50'][1]",
-        "a:text-is('50')", "button:text-is('50')", "span:text-is('50')", "li:text-is('50')",
-    ]:
-        try:
-            el = page.locator(loc).first
-            if el.count():
-                el.click(timeout=5000)
-                return loc
-        except Exception:
-            continue
-    return None
-
-
-def click_next(page):
-    for s in NEXT_SELECTORS:
-        el = page.locator(s).first
-        try:
-            if el.count() and el.is_visible() and el.is_enabled():
-                cls = (el.get_attribute("class") or "") + " " + (el.evaluate("e=>e.parentElement?e.parentElement.className:''") or "")
-                if "disabled" in cls:
-                    continue
-                el.click(timeout=5000)
-                return s
-        except Exception:
-            continue
-    return None
+def to_float(v):
+    if v in (None, ""):
+        return None
+    return float(str(v).replace(".", "").replace(",", ".")) if isinstance(v, str) else float(v)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max-pages", type=int, default=1000)
-    ap.add_argument("--headful", action="store_true")
-    ap.add_argument("--diagnose", action="store_true")
+    ap.add_argument("--ano", default="2025")
     args = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
 
-    network, api_f = [], open(OUT / "api_responses.jsonl", "w", encoding="utf-8")
+    try:
+        payload = via_requests(args.ano)
+        src = "requests"
+    except Exception as e:
+        print(f"requests falhou ({e}); usando Playwright", flush=True)
+        payload = via_playwright(args.ano)
+        src = "playwright"
 
-    def on_response(resp):
-        req = resp.request
-        if req.resource_type not in ("xhr", "fetch"):
-            return
-        entry = {"url": resp.url, "method": req.method, "status": resp.status, "post_data": req.post_data}
-        network.append(entry)
-        if "json" in (resp.headers.get("content-type") or ""):
-            try:
-                api_f.write(json.dumps({"url": resp.url, "post_data": req.post_data, "body": resp.json()}, ensure_ascii=False) + "\n")
-                api_f.flush()
-            except Exception:
-                pass
+    rows = payload["data"] if isinstance(payload, dict) else payload
+    print(f"{len(rows)} escolas via {src}")
+    (OUT / f"ranked_schools_{args.ano}_raw.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
-    all_rows, headers, seen = [], None, set()
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not args.headful)
-        page = browser.new_page(locale="pt-BR", viewport={"width": 1600, "height": 1200})
-        page.on("response", on_response)
-        try:
-            page.goto(URL, wait_until="networkidle", timeout=120000)
-            wait_rows(page)
-            if args.diagnose:
-                for e in network:
-                    print("NET", e["method"], e["status"], e["url"], (e["post_data"] or "")[:500])
-                with open(OUT / "api_responses.jsonl", encoding="utf-8") as fh:
-                    for line in fh:
-                        print("JSON", line[:1500])
-                html = page.content()
-                for kw in ["Resultados por p", "pagina", "pagination", "Próxim"]:
-                    for m in list(re.finditer(kw, html))[:2]:
-                        print("HTML[", kw, "]", html[max(0, m.start()-800):m.start()+1500].replace("\n", " "))
-                print("ROW0", table_rows(page)[0], table_rows(page)[1][:2])
-            how = set_page_size_50(page)
-            print(f"page-size 50 via: {how}", flush=True)
-            time.sleep(2)
-            page.wait_for_load_state("networkidle")
-
-            for n in range(1, args.max_pages + 1):
-                head, rows = table_rows(page)
-                if headers is None:
-                    headers = unique(head) if len(head) == len(rows[0]) else [f"col_{i+1}" for i in range(len(rows[0]))]
-                new = 0
-                for r in rows:
-                    k = tuple(r)
-                    if k not in seen:
-                        seen.add(k)
-                        all_rows.append(r)
-                        new += 1
-                print(f"página {n}: {len(rows)} linhas ({new} novas) total={len(all_rows)}", flush=True)
-                if new == 0 and n > 1:
-                    print("Sem linhas novas — fim.")
-                    break
-                first = rows[0]
-                if not click_next(page):
-                    print("Botão próximo não encontrado/desabilitado — fim.")
-                    break
-                # espera a tabela mudar
-                t0 = time.time()
-                while time.time() - t0 < 60:
-                    time.sleep(0.4)
-                    _, r2 = table_rows(page)
-                    if r2 and r2[0] != first:
-                        break
-                if n % 25 == 0:
-                    write_csv(headers, all_rows)
-        except Exception as e:
-            print("ERRO:", e, file=sys.stderr)
-            (OUT / "debug_page.html").write_text(page.content(), encoding="utf-8")
-            page.screenshot(path=str(OUT / "debug.png"), full_page=True)
-        finally:
-            (OUT / "network_log.json").write_text(json.dumps(network, ensure_ascii=False, indent=1), encoding="utf-8")
-            api_f.close()
-            browser.close()
-
-    if all_rows:
-        write_csv(headers, all_rows)
-    print(f"TOTAL: {len(all_rows)} linhas")
-    return 0 if all_rows else 1
-
-
-def write_csv(headers, rows):
-    with open(OUT / "ranking_enem_redacao.csv", "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f, delimiter=";")
-        w.writerow(headers)
-        w.writerows(rows)
+    rows.sort(key=lambda r: (r.get("PC") is None, r.get("PC") or 0))
+    for name, delim, enc in [(f"ranking_enem_{args.ano}.csv", ",", "utf-8"),
+                             (f"ranking_enem_{args.ano}_excel.csv", ";", "utf-8-sig")]:
+        with open(OUT / name, "w", newline="", encoding=enc) as f:
+            w = csv.writer(f, delimiter=delim)
+            w.writerow([c for _, c in COLS])
+            for r in rows:
+                out = []
+                for k, _ in COLS:
+                    v = r.get(k)
+                    if k in NUM:
+                        v = to_float(v)
+                        if v is not None and delim == ";":
+                            v = f"{v:.2f}".replace(".", ",")
+                    out.append(v)
+                w.writerow(out)
+    extra = set().union(*(r.keys() for r in rows)) - {k for k, _ in COLS}
+    if extra:
+        print("Campos não mapeados (mantidos no JSON bruto):", extra)
+    return 0
 
 
 if __name__ == "__main__":
