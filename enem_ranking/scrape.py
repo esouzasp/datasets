@@ -74,12 +74,18 @@ def main():
     try:
         payload = via_requests(args.ano)
         src = "requests"
+        if not (payload.get("data") if isinstance(payload, dict) else payload):
+            raise ValueError("vazio")
     except Exception as e:
         print(f"requests falhou ({e}); usando Playwright", flush=True)
         payload = via_playwright(args.ano)
         src = "playwright"
 
     rows = payload["data"] if isinstance(payload, dict) else payload
+    if not rows:
+        print(f"ANO {args.ano}: sem dados")
+        return 1
+    print(f"ANO {args.ano}: campos {sorted(rows[0].keys())}")
     print(f"{len(rows)} escolas via {src}")
     (OUT / f"ranked_schools_{args.ano}_raw.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
