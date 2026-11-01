@@ -1,0 +1,36 @@
+name: Scrape Ranking ENEM (Evolucional)
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: "Máximo de páginas"
+        default: "1000"
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install playwright && python -m playwright install --with-deps chromium
+      - run: python enem_ranking/scrape.py --max-pages ${{ github.event.inputs.max_pages || 1000 }}
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: enem-ranking-output
+          path: enem_ranking/data/
+      - name: Commit dados
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add enem_ranking/data/ranking_enem_redacao.csv enem_ranking/data/network_log.json || true
+          git diff --cached --quiet || git commit -m "data: ranking ENEM (Evolucional) atualizado"
+          git push
