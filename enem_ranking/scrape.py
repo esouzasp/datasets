@@ -80,7 +80,11 @@ def set_page_size_50(page):
     for sel in page.query_selector_all("select"):
         opts = [o.inner_text().strip() for o in sel.query_selector_all("option")]
         if "50" in opts:
-            sel.select_option(label="50")
+            try:
+                sel.select_option(label="50", timeout=3000)
+            except Exception:
+                sel.evaluate("""s=>{const o=[...s.options].find(o=>o.text.trim()=='50'); s.value=o.value;
+                    s.dispatchEvent(new Event('input',{bubbles:true})); s.dispatchEvent(new Event('change',{bubbles:true}));}""")
             return "select"
     # depois links/botões com texto "50" próximos de "Resultados por página"
     for loc in [
@@ -116,6 +120,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-pages", type=int, default=1000)
     ap.add_argument("--headful", action="store_true")
+    ap.add_argument("--diagnose", action="store_true")
     args = ap.parse_args()
     OUT.mkdir(parents=True, exist_ok=True)
 
@@ -142,6 +147,17 @@ def main():
         try:
             page.goto(URL, wait_until="networkidle", timeout=120000)
             wait_rows(page)
+            if args.diagnose:
+                for e in network:
+                    print("NET", e["method"], e["status"], e["url"], (e["post_data"] or "")[:500])
+                with open(OUT / "api_responses.jsonl", encoding="utf-8") as fh:
+                    for line in fh:
+                        print("JSON", line[:1500])
+                html = page.content()
+                for kw in ["Resultados por p", "pagina", "pagination", "Próxim"]:
+                    for m in list(re.finditer(kw, html))[:2]:
+                        print("HTML[", kw, "]", html[max(0, m.start()-800):m.start()+1500].replace("\n", " "))
+                print("ROW0", table_rows(page)[0], table_rows(page)[1][:2])
             how = set_page_size_50(page)
             print(f"page-size 50 via: {how}", flush=True)
             time.sleep(2)

@@ -6,6 +6,9 @@ on:
       max_pages:
         description: "Máximo de páginas"
         default: "1000"
+      diagnose:
+        description: "Modo diagnóstico (true/false)"
+        default: "false"
 
 permissions:
   contents: write
@@ -20,7 +23,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install playwright && python -m playwright install --with-deps chromium
-      - run: python enem_ranking/scrape.py --max-pages ${{ github.event.inputs.max_pages || 1000 }}
+      - run: python enem_ranking/scrape.py --max-pages ${{ github.event.inputs.max_pages || 1000 }} ${{ github.event.inputs.diagnose == 'true' && '--diagnose' || '' }}
         continue-on-error: true
       - uses: actions/upload-artifact@v4
         if: always()
