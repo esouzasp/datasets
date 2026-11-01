@@ -75,7 +75,8 @@ def main():
         payload = via_requests(args.ano)
         src = "requests"
         if not (payload.get("data") if isinstance(payload, dict) else payload):
-            raise ValueError("vazio")
+            print(f"ANO {args.ano}: endpoint sem dados (ano não publicado)")
+            return 1
     except Exception as e:
         print(f"requests falhou ({e}); usando Playwright", flush=True)
         payload = via_playwright(args.ano)
